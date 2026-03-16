@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>OLA小助手</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <main class="app-card">
+        <header class="hero">
+          <div class="brand-mark">
+            <img src="/assets/logo.png" alt="OLA logo" />
+          </div>
+          <div class="hero-copy">
+            <p class="eyebrow">OLA Assistant</p>
+            <h1>OLA小助手</h1>
+            <p class="subtitle">一个安静、简洁、能真正连通本地 Codex 的第一版对话界面。</p>
+          </div>
+        </header>
+
+        <section id="chat-log" class="chat-log" aria-live="polite">
+          <article class="message assistant">
+            <div class="bubble">
+              <p>你好，我是 OLA小助手。现在这版已经接上本地 Codex，直接发消息试试吧。</p>
+            </div>
+          </article>
+        </section>
+
+        <form id="chat-form" class="composer">
+          <label class="sr-only" for="message-input">输入消息</label>
+          <textarea
+            id="message-input"
+            name="message"
+            rows="3"
+            placeholder="请输入你想让 Codex 帮你处理的内容..."
+          ></textarea>
+          <div class="composer-bar">
+            <p id="status-text" class="status-text">本地模式已就绪</p>
+            <button id="send-button" type="submit">发送</button>
+          </div>
+        </form>
+      </main>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
