@@ -45,7 +45,7 @@ body {
 }
 
 .app-card {
-  width: min(1280px, 100%);
+  width: min(1440px, 100%);
   height: min(94vh, 980px);
   padding: 0;
   border-radius: var(--radius-xl);
@@ -54,7 +54,7 @@ body {
   box-shadow: var(--shadow);
   backdrop-filter: blur(24px);
   display: grid;
-  grid-template-columns: 320px minmax(0, 1fr);
+  grid-template-columns: 340px minmax(0, 1fr);
   overflow: hidden;
 }
 
