@@ -37,7 +37,7 @@ body {
 
 .page-shell {
   height: 100vh;
-  padding: 32px 18px;
+  padding: 18px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -45,9 +45,9 @@ body {
 }
 
 .app-card {
-  width: min(920px, 100%);
-  height: min(88vh, 900px);
-  padding: 28px;
+  width: min(1180px, 100%);
+  height: min(94vh, 980px);
+  padding: 30px;
   border-radius: var(--radius-xl);
   background: var(--card);
   border: 1px solid var(--card-border);
@@ -107,11 +107,11 @@ body {
   border-radius: var(--radius-lg);
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.62);
-  padding: 20px;
+  padding: 24px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 18px;
 }
 
 .message {
@@ -123,11 +123,11 @@ body {
 }
 
 .bubble {
-  max-width: min(78%, 700px);
-  padding: 16px 18px;
+  max-width: min(82%, 860px);
+  padding: 18px 20px;
   border-radius: var(--radius-md);
   line-height: 1.7;
-  font-size: 15px;
+  font-size: 16px;
   white-space: pre-wrap;
   word-break: break-word;
 }
@@ -148,7 +148,7 @@ body {
   border-radius: var(--radius-lg);
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.76);
-  padding: 16px;
+  padding: 18px;
 }
 
 .composer textarea {
@@ -158,7 +158,7 @@ body {
   background: transparent;
   color: var(--text);
   font: inherit;
-  font-size: 16px;
+  font-size: 17px;
   line-height: 1.65;
   outline: none;
 }
@@ -220,11 +220,12 @@ button:disabled {
 @media (max-width: 720px) {
   .page-shell {
     height: 100vh;
-    padding: 14px;
+    padding: 10px;
   }
 
   .app-card {
-    height: calc(100vh - 28px);
+    width: 100%;
+    height: calc(100vh - 20px);
     padding: 18px;
     border-radius: 24px;
   }
@@ -246,6 +247,7 @@ button:disabled {
 
   .bubble {
     max-width: 90%;
+    font-size: 15px;
   }
 
   .composer-bar {
