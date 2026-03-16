@@ -157,6 +157,8 @@ class CodexSession:
                 elif method == "error":
                     if params.get("turnId") != turn_id:
                         continue
+                    if params.get("willRetry"):
+                        continue
                     error = (params.get("error") or {}).get("message")
                     if error:
                         raise CodexRpcError(error)
