@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Deque, Dict, Optional
 from urllib.parse import urlparse
+from uuid import uuid4
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ CODEX_RS_DIR = REPO_ROOT / "codex-rs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 LOGO_PATH = Path("/Users/bytedance/Downloads/ola-logo-new.png")
 OLA_CODEX_HOME = Path.home() / ".ola-codex"
+CONVERSATIONS_PATH = OLA_CODEX_HOME / "ola_conversations.json"
 HOST = "127.0.0.1"
 PORT = 8765
 
@@ -39,6 +41,122 @@ class CodexRpcError(RuntimeError):
     pass
 
 
+class ConversationStore:
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        self._data = self._load()
+
+    def list_conversations(self) -> list[dict[str, Any]]:
+        with self._lock:
+            conversations = list(self._data["conversations"].values())
+
+        conversations.sort(key=lambda item: item["updatedAt"], reverse=True)
+        return [self._summary(item) for item in conversations]
+
+    def get_conversation(self, conversation_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            conversation = self._data["conversations"].get(conversation_id)
+            if conversation is None:
+                return None
+            return json.loads(json.dumps(conversation))
+
+    def delete_conversation(self, conversation_id: str) -> bool:
+        with self._lock:
+            if conversation_id not in self._data["conversations"]:
+                return False
+            del self._data["conversations"][conversation_id]
+            self._persist_locked()
+            return True
+
+    def ensure_conversation(self, conversation_id: Optional[str] = None) -> dict[str, Any]:
+        with self._lock:
+            if conversation_id:
+                existing = self._data["conversations"].get(conversation_id)
+                if existing is not None:
+                    return json.loads(json.dumps(existing))
+
+            now = int(time.time())
+            new_id = conversation_id or f"conv_{uuid4().hex}"
+            conversation = {
+                "id": new_id,
+                "title": "新对话",
+                "threadId": None,
+                "createdAt": now,
+                "updatedAt": now,
+                "messages": [],
+            }
+            self._data["conversations"][new_id] = conversation
+            self._persist_locked()
+            return json.loads(json.dumps(conversation))
+
+    def set_thread_id(self, conversation_id: str, thread_id: str) -> None:
+        with self._lock:
+            conversation = self._data["conversations"][conversation_id]
+            conversation["threadId"] = thread_id
+            conversation["updatedAt"] = int(time.time())
+            self._persist_locked()
+
+    def append_exchange(
+        self,
+        conversation_id: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> dict[str, Any]:
+        now = int(time.time())
+        with self._lock:
+            conversation = self._data["conversations"][conversation_id]
+            conversation["messages"].append(
+                {"role": "user", "text": user_text, "createdAt": now}
+            )
+            conversation["messages"].append(
+                {"role": "assistant", "text": assistant_text, "createdAt": now}
+            )
+            if conversation["title"] == "新对话" and user_text.strip():
+                conversation["title"] = self._make_title(user_text)
+            conversation["updatedAt"] = now
+            self._persist_locked()
+            return json.loads(json.dumps(conversation))
+
+    def _load(self) -> dict[str, Any]:
+        ensure_directory(self._path.parent)
+        if not self._path.exists():
+            return {"conversations": {}}
+
+        try:
+            return json.loads(self._path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {"conversations": {}}
+
+    def _persist_locked(self) -> None:
+        self._path.write_text(
+            json.dumps(self._data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def _make_title(text: str) -> str:
+        single_line = " ".join(text.strip().split())
+        return single_line[:24] + ("..." if len(single_line) > 24 else "")
+
+    @staticmethod
+    def _summary(conversation: dict[str, Any]) -> dict[str, Any]:
+        messages = conversation.get("messages", [])
+        last_message = messages[-1]["text"] if messages else ""
+        return {
+            "id": conversation["id"],
+            "title": conversation["title"],
+            "updatedAt": conversation["updatedAt"],
+            "createdAt": conversation["createdAt"],
+            "messageCount": len(messages),
+            "preview": last_message[:40] + ("..." if len(last_message) > 40 else ""),
+        }
+
+
+def ensure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
 class CodexSession:
     def __init__(self) -> None:
         self._process: Optional[subprocess.Popen[str]] = None
@@ -50,8 +168,6 @@ class CodexSession:
         self._interaction_lock = threading.Lock()
         self._stderr_lines: Deque[str] = deque(maxlen=50)
         self._initialized = False
-        self._thread_id: Optional[str] = None
-
     def start(self) -> None:
         cargo = discover_cargo()
         if cargo is None:
@@ -101,15 +217,15 @@ class CodexSession:
                 process.kill()
         self._process = None
 
-    def chat(self, message: str) -> dict[str, Any]:
+    def chat(self, conversation_id: str, thread_id: Optional[str], message: str) -> dict[str, Any]:
         with self._interaction_lock:
             self.start()
-            self._ensure_thread()
+            thread_id = self._ensure_thread(thread_id)
 
             turn = self._rpc(
                 "turn/start",
                 {
-                    "threadId": self._thread_id,
+                    "threadId": thread_id,
                     "input": [
                         {
                             "type": "text",
@@ -167,7 +283,12 @@ class CodexSession:
             if not reply:
                 reply = "Codex 已完成本轮，但没有返回可展示的文本。"
 
-            return {"reply": reply, "threadId": self._thread_id, "turnId": turn_id}
+            return {
+                "reply": reply,
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "conversationId": conversation_id,
+            }
 
     def _ensure_initialized(self) -> None:
         if self._initialized:
@@ -190,9 +311,9 @@ class CodexSession:
         self._notify("initialized", None)
         self._initialized = True
 
-    def _ensure_thread(self) -> None:
-        if self._thread_id is not None:
-            return
+    def _ensure_thread(self, thread_id: Optional[str]) -> str:
+        if thread_id is not None:
+            return thread_id
 
         response = self._rpc(
             "thread/start",
@@ -205,7 +326,7 @@ class CodexSession:
                 "persistExtendedHistory": False,
             },
         )
-        self._thread_id = response["thread"]["id"]
+        return response["thread"]["id"]
 
     def _stdout_reader(self) -> None:
         process = self._process
@@ -353,6 +474,7 @@ class CodexSession:
 
 
 SESSION = CodexSession()
+STORE = ConversationStore(CONVERSATIONS_PATH)
 
 
 class OLARequestHandler(BaseHTTPRequestHandler):
@@ -362,6 +484,19 @@ class OLARequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
             self._send_json(HTTPStatus.OK, {"ok": True})
+            return
+
+        if parsed.path == "/api/conversations":
+            self._send_json(HTTPStatus.OK, {"data": STORE.list_conversations()})
+            return
+
+        if parsed.path.startswith("/api/conversations/"):
+            conversation_id = parsed.path.split("/", 3)[-1]
+            conversation = STORE.get_conversation(conversation_id)
+            if conversation is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "会话不存在"})
+                return
+            self._send_json(HTTPStatus.OK, {"conversation": conversation})
             return
 
         if parsed.path == "/assets/logo.png":
@@ -379,6 +514,24 @@ class OLARequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/conversations":
+            conversation = STORE.ensure_conversation()
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "conversation": conversation,
+                    "summary": {
+                        "id": conversation["id"],
+                        "title": conversation["title"],
+                        "updatedAt": conversation["updatedAt"],
+                        "createdAt": conversation["createdAt"],
+                        "messageCount": 0,
+                        "preview": "",
+                    },
+                },
+            )
+            return
+
         if parsed.path != "/api/chat":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
@@ -397,12 +550,21 @@ class OLARequestHandler(BaseHTTPRequestHandler):
             return
 
         message = (payload.get("message") or "").strip()
+        conversation_id = payload.get("conversationId")
         if not message:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "message 不能为空"})
             return
 
         try:
-            result = SESSION.chat(message)
+            conversation = STORE.ensure_conversation(conversation_id)
+            result = SESSION.chat(
+                conversation["id"],
+                conversation.get("threadId"),
+                message,
+            )
+            if conversation.get("threadId") != result["threadId"]:
+                STORE.set_thread_id(conversation["id"], result["threadId"])
+            saved = STORE.append_exchange(conversation["id"], message, result["reply"])
         except Exception as exc:
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -413,7 +575,35 @@ class OLARequestHandler(BaseHTTPRequestHandler):
             )
             return
 
-        self._send_json(HTTPStatus.OK, result)
+        self._send_json(
+            HTTPStatus.OK,
+            {
+                **result,
+                "conversation": saved,
+                "summary": {
+                    "id": saved["id"],
+                    "title": saved["title"],
+                    "updatedAt": saved["updatedAt"],
+                    "createdAt": saved["createdAt"],
+                    "messageCount": len(saved["messages"]),
+                    "preview": saved["messages"][-1]["text"][:40],
+                },
+            },
+        )
+
+    def do_DELETE(self) -> None:
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/conversations/"):
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
+            return
+
+        conversation_id = parsed.path.split("/", 3)[-1]
+        deleted = STORE.delete_conversation(conversation_id)
+        if not deleted:
+            self._send_json(HTTPStatus.NOT_FOUND, {"error": "会话不存在"})
+            return
+
+        self._send_json(HTTPStatus.OK, {"ok": True, "conversationId": conversation_id})
 
     def log_message(self, format: str, *args: Any) -> None:
         return

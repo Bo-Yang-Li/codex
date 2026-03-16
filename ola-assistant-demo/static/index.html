@@ -8,39 +8,51 @@
   </head>
   <body>
     <div class="page-shell">
-      <main class="app-card">
-        <header class="hero">
-          <div class="brand-mark">
-            <img src="/assets/logo.png" alt="OLA logo" />
-          </div>
-          <div class="hero-copy">
-            <p class="eyebrow">OLA Assistant</p>
-            <h1>OLA小助手</h1>
-          </div>
-        </header>
-
-        <section id="chat-log" class="chat-log" aria-live="polite">
-          <article class="message assistant">
-            <div class="bubble">
-              <p>你好，我是 OLA小助手。现在这版已经接上本地 Codex，直接发消息试试吧。</p>
+      <div class="app-card">
+        <aside class="sidebar">
+          <div class="sidebar-top">
+            <div class="sidebar-brand">
+              <div class="brand-mark small">
+                <img src="/assets/logo.png" alt="OLA logo" />
+              </div>
+              <div class="sidebar-brand-copy">
+                <p class="eyebrow">OLA Assistant</p>
+                <h2>聊天历史</h2>
+              </div>
             </div>
-          </article>
-        </section>
-
-        <form id="chat-form" class="composer">
-          <label class="sr-only" for="message-input">输入消息</label>
-          <textarea
-            id="message-input"
-            name="message"
-            rows="3"
-            placeholder="请输入你想让 Codex 帮你处理的内容..."
-          ></textarea>
-          <div class="composer-bar">
-            <p id="status-text" class="status-text">本地模式已就绪</p>
-            <button id="send-button" type="submit">发送</button>
+            <button id="new-chat-button" class="secondary-button" type="button">新对话</button>
           </div>
-        </form>
-      </main>
+          <section id="conversation-list" class="conversation-list"></section>
+        </aside>
+
+        <main class="main-panel">
+          <header class="hero">
+            <div class="brand-mark">
+              <img src="/assets/logo.png" alt="OLA logo" />
+            </div>
+            <div class="hero-copy">
+              <p class="eyebrow">OLA Assistant</p>
+              <h1>OLA小助手</h1>
+            </div>
+          </header>
+
+          <section id="chat-log" class="chat-log" aria-live="polite"></section>
+
+          <form id="chat-form" class="composer">
+            <label class="sr-only" for="message-input">输入消息</label>
+            <textarea
+              id="message-input"
+              name="message"
+              rows="3"
+              placeholder="请输入你想让 Codex 帮你处理的内容..."
+            ></textarea>
+            <div class="composer-bar">
+              <p id="status-text" class="status-text">本地模式已就绪</p>
+              <button id="send-button" type="submit">发送</button>
+            </div>
+          </form>
+        </main>
+      </div>
     </div>
 
     <script src="/app.js"></script>
