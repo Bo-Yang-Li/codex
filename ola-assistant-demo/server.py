@@ -18,6 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CODEX_RS_DIR = REPO_ROOT / "codex-rs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 LOGO_PATH = Path("/Users/bytedance/Downloads/ola-logo-new.png")
+OLA_CODEX_HOME = Path.home() / ".ola-codex"
 HOST = "127.0.0.1"
 PORT = 8765
 
@@ -64,6 +65,7 @@ class CodexSession:
 
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
+        env.setdefault("CODEX_HOME", str(OLA_CODEX_HOME))
         cmd = [cargo, "run", "--bin", "codex", "--", "app-server"]
         self._process = subprocess.Popen(
             cmd,
@@ -448,6 +450,7 @@ class OLARequestHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    print(f"Using isolated CODEX_HOME at {OLA_CODEX_HOME}")
     print(f"OLA demo server starting at http://{HOST}:{PORT}")
     print("首次请求时会自动拉起 codex app-server，第一次可能会稍慢。")
     httpd = ThreadingHTTPServer((HOST, PORT), OLARequestHandler)

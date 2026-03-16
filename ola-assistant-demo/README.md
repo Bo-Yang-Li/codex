@@ -29,6 +29,13 @@ cargo run --bin codex
 /Users/bytedance/Downloads/ola-logo-new.png
 ```
 
+4. 初始化 OLA 的独立状态目录：
+
+```bash
+cd /Users/bytedance/Documents/GitHub/codex
+python3 ola-assistant-demo/setup_ola_home.py
+```
+
 ## 启动方式
 
 在仓库根目录执行：
@@ -46,9 +53,13 @@ http://127.0.0.1:8765
 
 ## 说明
 
+- OLA 现在默认使用独立的 `CODEX_HOME`：
+  `~/.ola-codex`
 - 第一次发送消息时，中间层会自动启动 `codex app-server`
 - 第一次可能会慢一些，因为 Rust 可能需要编译或初始化
 - 这版是最小闭环，先保证页面、接口、Codex 调用都能通
+- OLA 会隔离自己的配置、日志、会话和 memory，但会通过符号链接复用
+  `~/.codex/auth.json`，也就是继续使用你当前的 ChatGPT 登录态
 
 ## 停止服务
 
