@@ -140,6 +140,17 @@ function stopChatStatusPolling() {
   }
 }
 
+async function syncProgressForCurrentConversation() {
+  stopProgressPolling();
+
+  if (!currentConversationId) {
+    renderProgress({ visible: false, steps: [] });
+    return;
+  }
+
+  await fetchProgress();
+}
+
 function formatTime(timestamp) {
   if (!timestamp) {
     return "";
@@ -240,19 +251,23 @@ function renderConversationMessages(messages) {
 }
 
 async function loadConversation(conversationId) {
+  stopChatStatusPolling();
   const response = await fetch(`/api/conversations/${conversationId}`);
   const data = await response.json();
   currentConversationId = data.conversation.id;
   renderConversationMessages(data.conversation.messages || []);
   renderConversationList();
+  await syncProgressForCurrentConversation();
 }
 
 async function createConversation() {
+  stopChatStatusPolling();
   const response = await fetch("/api/conversations", { method: "POST" });
   const data = await response.json();
   currentConversationId = data.conversation.id;
   await refreshConversationList(currentConversationId);
   renderWelcome();
+  await syncProgressForCurrentConversation();
 }
 
 async function ensureActiveConversation() {
@@ -286,6 +301,7 @@ async function deleteConversation(conversationId) {
       currentConversationId = null;
       renderWelcome();
       renderConversationList();
+      await syncProgressForCurrentConversation();
     }
   }
 }
@@ -405,11 +421,10 @@ async function bootstrap() {
   await refreshConversationList();
   if (conversations.length) {
     await loadConversation(conversations[0].id);
-    await fetchProgress();
     return;
   }
   renderWelcome();
-  renderProgress({ visible: false, steps: [] });
+  await syncProgressForCurrentConversation();
 }
 
 bootstrap().catch((error) => {
