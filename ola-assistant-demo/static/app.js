@@ -13,6 +13,7 @@ const progressError = document.getElementById("progress-error");
 let currentConversationId = null;
 let conversations = [];
 let progressTimer = null;
+let chatStatusTimer = null;
 
 function addMessage(role, text) {
   const article = document.createElement("article");
@@ -26,6 +27,30 @@ function addMessage(role, text) {
   chatLog.appendChild(article);
   chatLog.scrollTop = chatLog.scrollHeight;
   return bubble;
+}
+
+function createStreamingAssistantMessage() {
+  const article = document.createElement("article");
+  article.className = "message assistant";
+
+  const stack = document.createElement("div");
+  stack.className = "assistant-stack";
+
+  const thinking = document.createElement("div");
+  thinking.className = "thinking-block";
+  thinking.textContent = "正在思考你的请求...";
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  bubble.textContent = "正在思考，请稍候...";
+
+  stack.appendChild(thinking);
+  stack.appendChild(bubble);
+  article.appendChild(stack);
+  chatLog.appendChild(article);
+  chatLog.scrollTop = chatLog.scrollHeight;
+
+  return { bubble, thinking };
 }
 
 function clearMessages() {
@@ -105,6 +130,13 @@ function stopProgressPolling() {
   if (progressTimer) {
     window.clearInterval(progressTimer);
     progressTimer = null;
+  }
+}
+
+function stopChatStatusPolling() {
+  if (chatStatusTimer) {
+    window.clearInterval(chatStatusTimer);
+    chatStatusTimer = null;
   }
 }
 
@@ -261,7 +293,7 @@ async function deleteConversation(conversationId) {
 async function sendMessage(message) {
   await ensureActiveConversation();
   addMessage("user", message);
-  const pendingBubble = addMessage("assistant", "正在思考，请稍候...");
+  const pending = createStreamingAssistantMessage();
   setBusy(true);
   startProgressPolling();
 
@@ -279,19 +311,71 @@ async function sendMessage(message) {
       throw new Error(data.error || "请求失败");
     }
 
-    currentConversationId = data.conversation.id;
-    pendingBubble.textContent = data.reply;
-    await refreshConversationList(currentConversationId);
-    await fetchProgress();
+    currentConversationId = data.conversationId;
+    pending.bubble.textContent = "";
+    await streamAssistantReply(currentConversationId, pending);
   } catch (error) {
-    pendingBubble.textContent = `请求失败：${error.message}`;
+    pending.thinking.textContent = "";
+    pending.bubble.textContent = `请求失败：${error.message}`;
     await fetchProgress().catch(() => {});
   } finally {
     stopProgressPolling();
+    stopChatStatusPolling();
     setBusy(false);
     input.focus();
     chatLog.scrollTop = chatLog.scrollHeight;
   }
+}
+
+async function streamAssistantReply(conversationId, pending) {
+  async function tick() {
+    const response = await fetch(
+      `/api/chat/status?conversationId=${encodeURIComponent(conversationId)}`,
+    );
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.error || "流式请求失败");
+    }
+
+    pending.thinking.textContent = data.thinking || "正在思考你的请求...";
+    pending.bubble.textContent = data.reply || "正在思考，请稍候...";
+    chatLog.scrollTop = chatLog.scrollHeight;
+
+    if (data.done) {
+      if (data.error) {
+        throw new Error(data.error);
+      }
+      pending.thinking.textContent = "";
+      if (data.summary) {
+        await refreshConversationList(data.summary.id);
+      } else {
+        await refreshConversationList(conversationId);
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  const completedImmediately = await tick();
+  if (completedImmediately) {
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    chatStatusTimer = window.setInterval(async () => {
+      try {
+        const done = await tick();
+        if (done) {
+          stopChatStatusPolling();
+          resolve();
+        }
+      } catch (error) {
+        stopChatStatusPolling();
+        reject(error);
+      }
+    }, 450);
+  });
 }
 
 form.addEventListener("submit", async (event) => {

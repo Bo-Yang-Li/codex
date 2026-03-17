@@ -368,6 +368,21 @@ body {
   box-shadow: 0 10px 24px rgba(15, 23, 42, 0.05);
 }
 
+.assistant-stack {
+  max-width: min(82%, 860px);
+  display: grid;
+  gap: 8px;
+}
+
+.thinking-block {
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.6;
+  padding: 2px 6px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .user .bubble {
   background: var(--user);
   color: #ffffff;

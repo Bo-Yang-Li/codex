@@ -10,7 +10,7 @@ from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Deque, Dict, Optional
+from typing import Any, Callable, Deque, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
@@ -246,7 +246,99 @@ class ProgressTracker:
         for step in state["steps"]:
             if step["key"] == key:
                 step["status"] = "done"
+            return
+
+
+class ChatTaskTracker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._tasks: dict[str, dict[str, Any]] = {}
+
+    def start(self, conversation_id: str) -> None:
+        with self._lock:
+            self._tasks[conversation_id] = {
+                "running": True,
+                "done": False,
+                "error": None,
+                "reply": "",
+                "thinking": "正在思考你的请求...",
+                "updatedAt": int(time.time()),
+            }
+
+    def append(self, conversation_id: str, delta: str) -> None:
+        with self._lock:
+            task = self._tasks.get(conversation_id)
+            if task is None:
                 return
+            task["reply"] += delta
+            task["updatedAt"] = int(time.time())
+
+    def replace(self, conversation_id: str, text: str) -> None:
+        with self._lock:
+            task = self._tasks.get(conversation_id)
+            if task is None:
+                return
+            task["reply"] = text
+            task["updatedAt"] = int(time.time())
+
+    def set_thinking(self, conversation_id: str, text: str) -> None:
+        with self._lock:
+            task = self._tasks.get(conversation_id)
+            if task is None:
+                return
+            task["thinking"] = text
+            task["updatedAt"] = int(time.time())
+
+    def append_thinking(self, conversation_id: str, delta: str) -> None:
+        with self._lock:
+            task = self._tasks.get(conversation_id)
+            if task is None:
+                return
+            current = task.get("thinking") or ""
+            task["thinking"] = current + delta
+            task["updatedAt"] = int(time.time())
+
+    def finish(self, conversation_id: str, text: str) -> None:
+        with self._lock:
+            task = self._tasks.get(conversation_id)
+            if task is None:
+                task = {}
+                self._tasks[conversation_id] = task
+            task.update(
+                {
+                    "running": False,
+                    "done": True,
+                    "error": None,
+                    "reply": text,
+                    "thinking": "",
+                    "updatedAt": int(time.time()),
+                }
+            )
+
+    def fail(self, conversation_id: str, message: str) -> None:
+        with self._lock:
+            task = self._tasks.get(conversation_id)
+            if task is None:
+                task = {}
+                self._tasks[conversation_id] = task
+            task.update(
+                {
+                    "running": False,
+                    "done": True,
+                    "error": message,
+                    "thinking": "",
+                    "updatedAt": int(time.time()),
+                }
+            )
+
+    def snapshot(self, conversation_id: Optional[str]) -> dict[str, Any]:
+        if not conversation_id:
+            return {"running": False, "done": False, "error": None, "reply": ""}
+        with self._lock:
+            task = self._tasks.get(conversation_id)
+            if task is None:
+                return {"running": False, "done": False, "error": None, "reply": ""}
+            return json.loads(json.dumps(task))
 
 
 class CodexSession:
@@ -309,12 +401,20 @@ class CodexSession:
                 process.kill()
         self._process = None
 
-    def chat(self, conversation_id: str, thread_id: Optional[str], message: str) -> dict[str, Any]:
+    def chat(
+        self,
+        conversation_id: str,
+        thread_id: Optional[str],
+        message: str,
+        on_delta: Optional[Callable[[str], None]] = None,
+    ) -> dict[str, Any]:
         with self._interaction_lock:
             PROGRESS.start(conversation_id)
+            TASKS.set_thinking(conversation_id, "正在连接本地 OLA 引擎...")
             self.start()
             thread_id = self._ensure_thread(thread_id)
             PROGRESS.mark_analyzing(conversation_id)
+            TASKS.set_thinking(conversation_id, "正在分析你的请求...")
 
             turn = self._rpc(
                 "turn/start",
@@ -328,6 +428,7 @@ class CodexSession:
                         }
                     ],
                     "approvalPolicy": "never",
+                    "summary": "detailed",
                 },
             )
             turn_id = turn["turn"]["id"]
@@ -345,9 +446,12 @@ class CodexSession:
                     if params.get("turnId") != turn_id:
                         continue
                     PROGRESS.mark_composing(conversation_id)
+                    TASKS.set_thinking(conversation_id, "正在整理最终回复...")
                     delta = params.get("delta", "")
                     if delta:
                         parts.append(delta)
+                        if on_delta is not None:
+                            on_delta(delta)
                 elif method == "item/completed":
                     if params.get("turnId") != turn_id:
                         continue
@@ -364,8 +468,10 @@ class CodexSession:
                         "collabAgentToolCall",
                     }:
                         PROGRESS.mark_tooling(conversation_id)
+                        TASKS.set_thinking(conversation_id, "正在调用工具和整理上下文...")
                     if item.get("type") == "agentMessage":
                         PROGRESS.mark_composing(conversation_id)
+                        TASKS.set_thinking(conversation_id, "正在整理最终回复...")
                         fallback_text = item.get("text") or fallback_text
                 elif method == "turn/completed":
                     turn_payload = params.get("turn") or {}
@@ -385,6 +491,10 @@ class CodexSession:
                     if params.get("turnId") != turn_id:
                         continue
                     if params.get("willRetry"):
+                        TASKS.set_thinking(
+                            conversation_id,
+                            f"连接暂时中断，正在重试... {(params.get('error') or {}).get('message', '')}".strip(),
+                        )
                         continue
                     error = (params.get("error") or {}).get("message")
                     if error:
@@ -397,6 +507,7 @@ class CodexSession:
                     item_type = item.get("type")
                     if item_type in {"plan", "reasoning"}:
                         PROGRESS.mark_analyzing(conversation_id)
+                        TASKS.set_thinking(conversation_id, "正在拆解任务步骤...")
                     elif item_type in {
                         "commandExecution",
                         "fileChange",
@@ -408,6 +519,25 @@ class CodexSession:
                         "collabAgentToolCall",
                     }:
                         PROGRESS.mark_tooling(conversation_id)
+                        TASKS.set_thinking(conversation_id, "正在执行任务步骤...")
+                elif method == "item/plan/delta":
+                    if params.get("turnId") != turn_id:
+                        continue
+                    delta = params.get("delta", "")
+                    if delta:
+                        TASKS.append_thinking(conversation_id, delta)
+                elif method == "item/reasoning/textDelta":
+                    if params.get("turnId") != turn_id:
+                        continue
+                    delta = params.get("delta", "")
+                    if delta:
+                        TASKS.append_thinking(conversation_id, delta)
+                elif method == "item/reasoning/summaryTextDelta":
+                    if params.get("turnId") != turn_id:
+                        continue
+                    delta = params.get("delta", "")
+                    if delta:
+                        TASKS.append_thinking(conversation_id, delta)
 
             reply = "".join(parts).strip() or (fallback_text or "").strip()
             if not reply:
@@ -606,6 +736,45 @@ class CodexSession:
 SESSION = CodexSession()
 STORE = ConversationStore(CONVERSATIONS_PATH)
 PROGRESS = ProgressTracker()
+TASKS = ChatTaskTracker()
+
+
+def build_summary(conversation: dict[str, Any]) -> dict[str, Any]:
+    messages = conversation["messages"]
+    last_text = messages[-1]["text"] if messages else ""
+    return {
+        "id": conversation["id"],
+        "title": conversation["title"],
+        "updatedAt": conversation["updatedAt"],
+        "createdAt": conversation["createdAt"],
+        "messageCount": len(messages),
+        "preview": last_text[:40] + ("..." if len(last_text) > 40 else ""),
+    }
+
+
+def run_chat_task(conversation_id: str, message: str) -> None:
+    try:
+        conversation = STORE.ensure_conversation(conversation_id)
+        result = SESSION.chat(
+            conversation["id"],
+            conversation.get("threadId"),
+            message,
+            on_delta=lambda delta: TASKS.append(conversation["id"], delta),
+        )
+        if conversation.get("threadId") != result["threadId"]:
+            STORE.set_thread_id(conversation["id"], result["threadId"])
+        saved = STORE.append_exchange(conversation["id"], message, result["reply"])
+        TASKS.finish(conversation["id"], result["reply"])
+        summaries = STORE.list_conversations()
+        latest_summary = next(
+            (summary for summary in summaries if summary["id"] == conversation["id"]),
+            build_summary(saved),
+        )
+        with TASKS._lock:
+            TASKS._tasks[conversation["id"]]["conversation"] = saved
+            TASKS._tasks[conversation["id"]]["summary"] = latest_summary
+    except Exception as exc:
+        TASKS.fail(conversation_id, str(exc))
 
 
 class OLARequestHandler(BaseHTTPRequestHandler):
@@ -624,6 +793,11 @@ class OLARequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/progress":
             conversation_id = parse_qs(parsed.query).get("conversationId", [None])[0]
             self._send_json(HTTPStatus.OK, PROGRESS.snapshot(conversation_id))
+            return
+
+        if parsed.path == "/api/chat/status":
+            conversation_id = parse_qs(parsed.query).get("conversationId", [None])[0]
+            self._send_json(HTTPStatus.OK, TASKS.snapshot(conversation_id))
             return
 
         if parsed.path.startswith("/api/conversations/"):
@@ -693,14 +867,12 @@ class OLARequestHandler(BaseHTTPRequestHandler):
 
         try:
             conversation = STORE.ensure_conversation(conversation_id)
-            result = SESSION.chat(
-                conversation["id"],
-                conversation.get("threadId"),
-                message,
-            )
-            if conversation.get("threadId") != result["threadId"]:
-                STORE.set_thread_id(conversation["id"], result["threadId"])
-            saved = STORE.append_exchange(conversation["id"], message, result["reply"])
+            TASKS.start(conversation["id"])
+            threading.Thread(
+                target=run_chat_task,
+                args=(conversation["id"], message),
+                daemon=True,
+            ).start()
         except Exception as exc:
             self._send_json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
@@ -714,16 +886,8 @@ class OLARequestHandler(BaseHTTPRequestHandler):
         self._send_json(
             HTTPStatus.OK,
             {
-                **result,
-                "conversation": saved,
-                "summary": {
-                    "id": saved["id"],
-                    "title": saved["title"],
-                    "updatedAt": saved["updatedAt"],
-                    "createdAt": saved["createdAt"],
-                    "messageCount": len(saved["messages"]),
-                    "preview": saved["messages"][-1]["text"][:40],
-                },
+                "ok": True,
+                "conversationId": conversation["id"],
             },
         )
 
