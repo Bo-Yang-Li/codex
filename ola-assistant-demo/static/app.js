@@ -5,9 +5,14 @@ const sendButton = document.getElementById("send-button");
 const statusText = document.getElementById("status-text");
 const conversationList = document.getElementById("conversation-list");
 const newChatButton = document.getElementById("new-chat-button");
+const workspace = document.getElementById("workspace");
+const progressPanel = document.getElementById("progress-panel");
+const progressList = document.getElementById("progress-list");
+const progressError = document.getElementById("progress-error");
 
 let currentConversationId = null;
 let conversations = [];
+let progressTimer = null;
 
 function addMessage(role, text) {
   const article = document.createElement("article");
@@ -36,6 +41,71 @@ function setBusy(isBusy) {
   sendButton.disabled = isBusy;
   input.disabled = isBusy;
   statusText.textContent = isBusy ? "正在请求本地 Codex..." : "本地模式已就绪";
+}
+
+function renderProgress(snapshot) {
+  const hasVisibleProgress = snapshot && snapshot.visible;
+  progressPanel.classList.toggle("hidden", !hasVisibleProgress);
+  workspace.classList.toggle("with-progress", hasVisibleProgress);
+
+  if (!hasVisibleProgress) {
+    progressList.innerHTML = "";
+    progressError.textContent = "";
+    progressError.classList.add("hidden");
+    return;
+  }
+
+  progressList.innerHTML = "";
+  (snapshot.steps || []).forEach((step) => {
+    const item = document.createElement("li");
+    item.className = `progress-item ${step.status || "pending"}`;
+
+    const bullet = document.createElement("span");
+    bullet.className = "progress-bullet";
+    bullet.textContent = step.status === "done" ? "✓" : step.status === "active" ? "…" : "";
+
+    const label = document.createElement("span");
+    label.className = "progress-label";
+    label.textContent = step.label;
+
+    item.appendChild(bullet);
+    item.appendChild(label);
+    progressList.appendChild(item);
+  });
+
+  if (snapshot.error) {
+    progressError.textContent = snapshot.error;
+    progressError.classList.remove("hidden");
+  } else {
+    progressError.textContent = "";
+    progressError.classList.add("hidden");
+  }
+}
+
+async function fetchProgress() {
+  if (!currentConversationId) {
+    renderProgress({ visible: false, steps: [] });
+    return;
+  }
+
+  const response = await fetch(`/api/progress?conversationId=${encodeURIComponent(currentConversationId)}`);
+  const data = await response.json();
+  renderProgress(data);
+}
+
+function startProgressPolling() {
+  stopProgressPolling();
+  fetchProgress().catch(() => {});
+  progressTimer = window.setInterval(() => {
+    fetchProgress().catch(() => {});
+  }, 800);
+}
+
+function stopProgressPolling() {
+  if (progressTimer) {
+    window.clearInterval(progressTimer);
+    progressTimer = null;
+  }
 }
 
 function formatTime(timestamp) {
@@ -153,6 +223,18 @@ async function createConversation() {
   renderWelcome();
 }
 
+async function ensureActiveConversation() {
+  if (currentConversationId) {
+    return currentConversationId;
+  }
+
+  const response = await fetch("/api/conversations", { method: "POST" });
+  const data = await response.json();
+  currentConversationId = data.conversation.id;
+  await refreshConversationList(currentConversationId);
+  return currentConversationId;
+}
+
 async function deleteConversation(conversationId) {
   const response = await fetch(`/api/conversations/${conversationId}`, {
     method: "DELETE",
@@ -177,9 +259,11 @@ async function deleteConversation(conversationId) {
 }
 
 async function sendMessage(message) {
+  await ensureActiveConversation();
   addMessage("user", message);
   const pendingBubble = addMessage("assistant", "正在思考，请稍候...");
   setBusy(true);
+  startProgressPolling();
 
   try {
     const response = await fetch("/api/chat", {
@@ -198,9 +282,12 @@ async function sendMessage(message) {
     currentConversationId = data.conversation.id;
     pendingBubble.textContent = data.reply;
     await refreshConversationList(currentConversationId);
+    await fetchProgress();
   } catch (error) {
     pendingBubble.textContent = `请求失败：${error.message}`;
+    await fetchProgress().catch(() => {});
   } finally {
+    stopProgressPolling();
     setBusy(false);
     input.focus();
     chatLog.scrollTop = chatLog.scrollHeight;
@@ -234,9 +321,11 @@ async function bootstrap() {
   await refreshConversationList();
   if (conversations.length) {
     await loadConversation(conversations[0].id);
+    await fetchProgress();
     return;
   }
   renderWelcome();
+  renderProgress({ visible: false, steps: [] });
 }
 
 bootstrap().catch((error) => {

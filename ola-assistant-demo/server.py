@@ -11,7 +11,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Deque, Dict, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 
@@ -23,6 +23,13 @@ OLA_CODEX_HOME = Path.home() / ".ola-codex"
 CONVERSATIONS_PATH = OLA_CODEX_HOME / "ola_conversations.json"
 HOST = "127.0.0.1"
 PORT = 8765
+PROGRESS_STEPS = [
+    ("connect", "连接本地 OLA 引擎"),
+    ("analyze", "分析你的请求"),
+    ("tool", "检索上下文 / 执行任务"),
+    ("compose", "整理并生成回复"),
+    ("done", "完成"),
+]
 
 
 def discover_cargo() -> Optional[str]:
@@ -157,6 +164,91 @@ def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+class ProgressTracker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._states: dict[str, dict[str, Any]] = {}
+
+    def start(self, conversation_id: str) -> None:
+        with self._lock:
+            self._states[conversation_id] = {
+                "visible": True,
+                "completed": False,
+                "error": None,
+                "steps": [
+                    {"key": key, "label": label, "status": "pending"}
+                    for key, label in PROGRESS_STEPS
+                ],
+            }
+            self._set_active_locked(conversation_id, "connect")
+
+    def mark_analyzing(self, conversation_id: str) -> None:
+        with self._lock:
+            self._mark_done_locked(conversation_id, "connect")
+            self._set_active_locked(conversation_id, "analyze")
+
+    def mark_tooling(self, conversation_id: str) -> None:
+        with self._lock:
+            self._mark_done_locked(conversation_id, "connect")
+            self._mark_done_locked(conversation_id, "analyze")
+            self._set_active_locked(conversation_id, "tool")
+
+    def mark_composing(self, conversation_id: str) -> None:
+        with self._lock:
+            self._mark_done_locked(conversation_id, "connect")
+            self._mark_done_locked(conversation_id, "analyze")
+            self._mark_done_locked(conversation_id, "tool")
+            self._set_active_locked(conversation_id, "compose")
+
+    def finish(self, conversation_id: str) -> None:
+        with self._lock:
+            if conversation_id not in self._states:
+                return
+            for key, _label in PROGRESS_STEPS[:-1]:
+                self._mark_done_locked(conversation_id, key)
+            self._set_active_locked(conversation_id, "done")
+            self._mark_done_locked(conversation_id, "done")
+            self._states[conversation_id]["completed"] = True
+
+    def fail(self, conversation_id: str, message: str) -> None:
+        with self._lock:
+            if conversation_id not in self._states:
+                self.start(conversation_id)
+            self._states[conversation_id]["error"] = message
+            self._states[conversation_id]["completed"] = True
+
+    def snapshot(self, conversation_id: Optional[str]) -> dict[str, Any]:
+        if not conversation_id:
+            return {"visible": False, "completed": False, "error": None, "steps": []}
+
+        with self._lock:
+            state = self._states.get(conversation_id)
+            if state is None:
+                return {"visible": False, "completed": False, "error": None, "steps": []}
+            return json.loads(json.dumps(state))
+
+    def _set_active_locked(self, conversation_id: str, key: str) -> None:
+        state = self._states.get(conversation_id)
+        if state is None:
+            return
+        for step in state["steps"]:
+            if step["status"] == "active":
+                step["status"] = "done"
+        for step in state["steps"]:
+            if step["key"] == key and step["status"] == "pending":
+                step["status"] = "active"
+                return
+
+    def _mark_done_locked(self, conversation_id: str, key: str) -> None:
+        state = self._states.get(conversation_id)
+        if state is None:
+            return
+        for step in state["steps"]:
+            if step["key"] == key:
+                step["status"] = "done"
+                return
+
+
 class CodexSession:
     def __init__(self) -> None:
         self._process: Optional[subprocess.Popen[str]] = None
@@ -219,8 +311,10 @@ class CodexSession:
 
     def chat(self, conversation_id: str, thread_id: Optional[str], message: str) -> dict[str, Any]:
         with self._interaction_lock:
+            PROGRESS.start(conversation_id)
             self.start()
             thread_id = self._ensure_thread(thread_id)
+            PROGRESS.mark_analyzing(conversation_id)
 
             turn = self._rpc(
                 "turn/start",
@@ -250,6 +344,7 @@ class CodexSession:
                 if method == "item/agentMessage/delta":
                     if params.get("turnId") != turn_id:
                         continue
+                    PROGRESS.mark_composing(conversation_id)
                     delta = params.get("delta", "")
                     if delta:
                         parts.append(delta)
@@ -257,7 +352,20 @@ class CodexSession:
                     if params.get("turnId") != turn_id:
                         continue
                     item = params.get("item") or {}
+                    item_type = item.get("type")
+                    if item_type in {
+                        "commandExecution",
+                        "fileChange",
+                        "mcpToolCall",
+                        "dynamicToolCall",
+                        "webSearch",
+                        "imageView",
+                        "imageGeneration",
+                        "collabAgentToolCall",
+                    }:
+                        PROGRESS.mark_tooling(conversation_id)
                     if item.get("type") == "agentMessage":
+                        PROGRESS.mark_composing(conversation_id)
                         fallback_text = item.get("text") or fallback_text
                 elif method == "turn/completed":
                     turn_payload = params.get("turn") or {}
@@ -266,9 +374,12 @@ class CodexSession:
                     status = turn_payload.get("status")
                     if status == "failed":
                         error = (turn_payload.get("error") or {}).get("message")
+                        PROGRESS.fail(conversation_id, error or "Codex turn failed.")
                         raise CodexRpcError(error or "Codex turn failed.")
                     if status == "interrupted":
+                        PROGRESS.fail(conversation_id, "Codex turn was interrupted.")
                         raise CodexRpcError("Codex turn was interrupted.")
+                    PROGRESS.finish(conversation_id)
                     break
                 elif method == "error":
                     if params.get("turnId") != turn_id:
@@ -277,7 +388,26 @@ class CodexSession:
                         continue
                     error = (params.get("error") or {}).get("message")
                     if error:
+                        PROGRESS.fail(conversation_id, error)
                         raise CodexRpcError(error)
+                elif method == "item/started":
+                    if params.get("turnId") != turn_id:
+                        continue
+                    item = params.get("item") or {}
+                    item_type = item.get("type")
+                    if item_type in {"plan", "reasoning"}:
+                        PROGRESS.mark_analyzing(conversation_id)
+                    elif item_type in {
+                        "commandExecution",
+                        "fileChange",
+                        "mcpToolCall",
+                        "dynamicToolCall",
+                        "webSearch",
+                        "imageView",
+                        "imageGeneration",
+                        "collabAgentToolCall",
+                    }:
+                        PROGRESS.mark_tooling(conversation_id)
 
             reply = "".join(parts).strip() or (fallback_text or "").strip()
             if not reply:
@@ -475,6 +605,7 @@ class CodexSession:
 
 SESSION = CodexSession()
 STORE = ConversationStore(CONVERSATIONS_PATH)
+PROGRESS = ProgressTracker()
 
 
 class OLARequestHandler(BaseHTTPRequestHandler):
@@ -488,6 +619,11 @@ class OLARequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/conversations":
             self._send_json(HTTPStatus.OK, {"data": STORE.list_conversations()})
+            return
+
+        if parsed.path == "/api/progress":
+            conversation_id = parse_qs(parsed.query).get("conversationId", [None])[0]
+            self._send_json(HTTPStatus.OK, PROGRESS.snapshot(conversation_id))
             return
 
         if parsed.path.startswith("/api/conversations/"):

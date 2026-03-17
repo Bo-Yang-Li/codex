@@ -36,21 +36,34 @@
             </div>
           </header>
 
-          <section id="chat-log" class="chat-log" aria-live="polite"></section>
+          <section id="workspace" class="workspace">
+            <div class="conversation-panel">
+              <section id="chat-log" class="chat-log" aria-live="polite"></section>
 
-          <form id="chat-form" class="composer">
-            <label class="sr-only" for="message-input">输入消息</label>
-            <textarea
-              id="message-input"
-              name="message"
-              rows="3"
-              placeholder="请输入你想让 OLA 帮你处理的内容..."
-            ></textarea>
-            <div class="composer-bar">
-              <p id="status-text" class="status-text">本地模式已就绪</p>
-              <button id="send-button" type="submit">发送</button>
+              <form id="chat-form" class="composer">
+                <label class="sr-only" for="message-input">输入消息</label>
+                <textarea
+                  id="message-input"
+                  name="message"
+                  rows="3"
+                  placeholder="请输入你想让 OLA 帮你处理的内容..."
+                ></textarea>
+                <div class="composer-bar">
+                  <p id="status-text" class="status-text">本地模式已就绪</p>
+                  <button id="send-button" type="submit">发送</button>
+                </div>
+              </form>
             </div>
-          </form>
+
+            <aside id="progress-panel" class="progress-panel hidden">
+              <div class="progress-header">
+                <p class="eyebrow">Progress</p>
+                <h3>执行进度</h3>
+              </div>
+              <div id="progress-error" class="progress-error hidden"></div>
+              <ol id="progress-list" class="progress-list"></ol>
+            </aside>
+          </section>
         </main>
       </div>
     </div>
