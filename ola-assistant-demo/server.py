@@ -414,7 +414,7 @@ class CodexSession:
         self._notifications: Deque[dict[str, Any]] = deque()
         self._server_requests: Deque[dict[str, Any]] = deque()
         self._condition = threading.Condition()
-        self._interaction_lock = threading.RLock()
+        self._interaction_lock = threading.Lock()
         self._stderr_lines: Deque[str] = deque(maxlen=50)
         self._initialized = False
 
@@ -432,7 +432,6 @@ class CodexSession:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env.setdefault("CODEX_HOME", str(OLA_CODEX_HOME))
-        env.setdefault("BYTEDANCE_GPT_API_KEY", "snC6vmssqGAt1xFyWjRXYB95e6us4iWJ_GPT_AK")
         cmd = [cargo, "run", "--bin", "codex", "--", "app-server"]
         self._process = subprocess.Popen(
             cmd,
