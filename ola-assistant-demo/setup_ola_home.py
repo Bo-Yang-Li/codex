@@ -44,6 +44,8 @@ def main() -> None:
             '\n'.join(
                 [
                     'model = "gpt-5.4"',
+                    'agent_max_threads = 3',
+                    'model_auto_compact_token_limit = 120000',
                     '',
                     '[projects."/Users/bytedance/Documents/GitHub/codex"]',
                     'trust_level = "trusted"',
@@ -59,7 +61,7 @@ def main() -> None:
     print("说明：")
     print(f"- 会话、日志、memory、配置会写到 {TARGET_HOME}")
     if target_auth.exists():
-        print(f"- 认证沿用现有登录态：{target_auth} -> {source_auth}")
+        print(f"- 认证沿用现有 ChatGPT 登录态：{target_auth} -> {source_auth}")
     else:
         print("- 没找到 ~/.codex/auth.json，请先在官方 Codex 中登录一次")
 

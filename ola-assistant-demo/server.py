@@ -2,6 +2,7 @@
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -14,14 +15,17 @@ from typing import Any, Callable, Deque, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
-from batch_analysis import BatchCaseAnalyzer, maybe_parse_case_export, should_use_batch_mode
+from batch_analysis import build_native_batch_prompt, maybe_parse_case_export, should_use_batch_mode
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CODEX_RS_DIR = REPO_ROOT / "codex-rs"
 STATIC_DIR = Path(__file__).resolve().parent / "static"
+OLA_DEMO_DIR = Path(__file__).resolve().parent
 LOGO_PATH = Path("/Users/bytedance/Downloads/ola-logo-new.png")
 OLA_CODEX_HOME = Path.home() / ".ola-codex"
 CONVERSATIONS_PATH = OLA_CODEX_HOME / "ola_conversations.json"
+OLA_LOG_PATH = OLA_CODEX_HOME / "log" / "ola-assistant.log"
+BATCH_INPUT_DIR = Path("/tmp/ola-codex-batch")
 HOST = "127.0.0.1"
 PORT = 8765
 PROGRESS_STEPS = [
@@ -31,6 +35,71 @@ PROGRESS_STEPS = [
     ("compose", "整理并生成回复"),
     ("done", "完成"),
 ]
+
+
+def load_ola_config_text() -> str:
+    config_path = OLA_CODEX_HOME / "config.toml"
+    if not config_path.exists():
+        return ""
+    return config_path.read_text(encoding="utf-8", errors="ignore")
+
+
+def log_event(message: str) -> None:
+    ensure_directory(OLA_LOG_PATH.parent)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    try:
+        with OLA_LOG_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{timestamp}] {message}\n")
+    except OSError:
+        pass
+
+
+def load_local_env() -> None:
+    for env_file in [OLA_DEMO_DIR / ".env.local", OLA_DEMO_DIR / ".env"]:
+        if not env_file.exists():
+            continue
+        for raw_line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key:
+                os.environ.setdefault(key, value)
+
+
+def active_model_provider_id() -> Optional[str]:
+    config_text = load_ola_config_text()
+    match = re.search(r'^model_provider\s*=\s*"([^"]+)"', config_text, flags=re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def active_provider_env_key() -> Optional[str]:
+    provider_id = active_model_provider_id()
+    if provider_id is None:
+        return None
+    config_text = load_ola_config_text()
+    pattern = (
+        r'^\[model_providers\.'
+        + re.escape(provider_id)
+        + r'\]\n(?:(?!^\[).*\n)*?env_key\s*=\s*"([^"]+)"'
+    )
+    match = re.search(pattern, config_text, flags=re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def validate_provider_env() -> None:
+    provider_id = active_model_provider_id()
+    env_key = active_provider_env_key()
+    if provider_id in {None, "", "openai"} or env_key is None:
+        return
+    if os.environ.get(env_key):
+        return
+    raise RuntimeError(
+        f"当前 OLA 使用自定义 provider `{provider_id}`，但缺少环境变量 `{env_key}`。"
+        f"请先 `export {env_key}=...` 后再启动服务。"
+    )
 
 
 def discover_cargo() -> Optional[str]:
@@ -43,6 +112,16 @@ def discover_cargo() -> Optional[str]:
         return str(fallback)
 
     return None
+
+
+def prepare_user_message(message: str) -> str:
+    if len(message) < 5000:
+        return message
+    return (
+        "请尽量简洁输出，优先给结论和最关键依据，控制在 220 字以内；"
+        "如果输入材料很长，不要复述原文，只提炼最重要的判断。\n\n"
+        + message
+    )
 
 
 class CodexRpcError(RuntimeError):
@@ -163,6 +242,14 @@ class ConversationStore:
 
 def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def persist_batch_input(conversation_id: str, message: str) -> Path:
+    ensure_directory(BATCH_INPUT_DIR)
+    timestamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+    path = BATCH_INPUT_DIR / f"{conversation_id}-{timestamp}.txt"
+    path.write_text(message, encoding="utf-8")
+    return path
 
 
 class ProgressTracker:
@@ -414,7 +501,7 @@ class CodexSession:
         self._notifications: Deque[dict[str, Any]] = deque()
         self._server_requests: Deque[dict[str, Any]] = deque()
         self._condition = threading.Condition()
-        self._interaction_lock = threading.Lock()
+        self._interaction_lock = threading.RLock()
         self._stderr_lines: Deque[str] = deque(maxlen=50)
         self._initialized = False
 
@@ -429,9 +516,16 @@ class CodexSession:
         if self._process is not None:
             return
 
+        validate_provider_env()
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env.setdefault("CODEX_HOME", str(OLA_CODEX_HOME))
+        log_event(
+            "starting codex app-server"
+            f" provider={active_model_provider_id()}"
+            f" env_key={active_provider_env_key()}"
+            f" env_present={'yes' if active_provider_env_key() and env.get(active_provider_env_key() or '') else 'no'}"
+        )
         cmd = [cargo, "run", "--bin", "codex", "--", "app-server"]
         self._process = subprocess.Popen(
             cmd,
@@ -473,6 +567,7 @@ class CodexSession:
         thread_id: Optional[str],
         message: str,
         on_delta: Optional[Callable[[str], None]] = None,
+        apply_briefing: bool = True,
     ) -> dict[str, Any]:
         with self._interaction_lock:
             PROGRESS.start(conversation_id)
@@ -491,6 +586,7 @@ class CodexSession:
                     params,
                 ),
                 conversation_id=conversation_id,
+                apply_briefing=apply_briefing,
             )
 
     def run_turn(
@@ -500,10 +596,12 @@ class CodexSession:
         on_delta: Optional[Callable[[str], None]] = None,
         on_event: Optional[Callable[[str, dict[str, Any]], None]] = None,
         conversation_id: Optional[str] = None,
+        apply_briefing: bool = True,
     ) -> dict[str, Any]:
         with self._interaction_lock:
             self.start()
             thread_id = self._ensure_thread(thread_id)
+            prepared_message = prepare_user_message(message) if apply_briefing else message
             turn = self._rpc(
                 "turn/start",
                 {
@@ -511,17 +609,17 @@ class CodexSession:
                     "input": [
                         {
                             "type": "text",
-                            "text": message,
+                            "text": prepared_message,
                             "text_elements": [],
                         }
                     ],
                     "approvalPolicy": "never",
-                    "summary": "detailed",
                 },
             )
             turn_id = turn["turn"]["id"]
             parts: list[str] = []
             fallback_text: Optional[str] = None
+            truncated_by_max_tokens = False
 
             while True:
                 self._drain_server_requests()
@@ -561,11 +659,20 @@ class CodexSession:
                         continue
                     error = (params.get("error") or {}).get("message")
                     if error:
+                        if "max_output_tokens" in error and (parts or fallback_text):
+                            truncated_by_max_tokens = True
+                            log_event(
+                                "turn hit max_output_tokens but partial output exists; "
+                                f"turn_id={turn_id} partial_len={len(''.join(parts) or (fallback_text or ''))}"
+                            )
+                            break
                         raise CodexRpcError(error)
 
             reply = "".join(parts).strip() or (fallback_text or "").strip()
             if not reply:
                 reply = "Codex 已完成本轮，但没有返回可展示的文本。"
+            elif truncated_by_max_tokens:
+                reply += "\n\n[输出因 provider 的 max_output_tokens 限制被截断]"
 
             return {
                 "reply": reply,
@@ -585,6 +692,11 @@ class CodexSession:
             TASKS.set_thinking(conversation_id, "正在整理最终回复...")
             return
 
+        if method == "thread/compacted":
+            PROGRESS.mark_tooling(conversation_id)
+            TASKS.set_thinking(conversation_id, "上下文已自动压缩，正在继续分析...")
+            return
+
         if method == "item/completed":
             item = params.get("item") or {}
             item_type = item.get("type")
@@ -597,9 +709,15 @@ class CodexSession:
                 "imageView",
                 "imageGeneration",
                 "collabAgentToolCall",
+                "contextCompaction",
             }:
                 PROGRESS.mark_tooling(conversation_id)
-                TASKS.set_thinking(conversation_id, "正在调用工具和整理上下文...")
+                if item_type == "collabAgentToolCall":
+                    TASKS.set_thinking(conversation_id, "正在调用 Codex 原生子 Agent 协同分析...")
+                elif item_type == "contextCompaction":
+                    TASKS.set_thinking(conversation_id, "正在压缩上下文并继续处理超长输入...")
+                else:
+                    TASKS.set_thinking(conversation_id, "正在调用工具和整理上下文...")
             if item_type == "agentMessage":
                 PROGRESS.mark_composing(conversation_id)
                 TASKS.set_thinking(conversation_id, "正在整理最终回复...")
@@ -643,9 +761,15 @@ class CodexSession:
                 "imageView",
                 "imageGeneration",
                 "collabAgentToolCall",
+                "contextCompaction",
             }:
                 PROGRESS.mark_tooling(conversation_id)
-                TASKS.set_thinking(conversation_id, "正在执行任务步骤...")
+                if item_type == "collabAgentToolCall":
+                    TASKS.set_thinking(conversation_id, "正在分派 Codex 原生子 Agent...")
+                elif item_type == "contextCompaction":
+                    TASKS.set_thinking(conversation_id, "正在触发上下文压缩...")
+                else:
+                    TASKS.set_thinking(conversation_id, "正在执行任务步骤...")
             return
 
         if method in {"item/plan/delta", "item/reasoning/textDelta", "item/reasoning/summaryTextDelta"}:
@@ -727,6 +851,7 @@ class CodexSession:
             line = raw_line.rstrip()
             if line:
                 self._stderr_lines.append(line)
+                log_event(f"app-server stderr: {line}")
 
     def _rpc(self, method: str, params: Optional[dict[str, Any]]) -> dict[str, Any]:
         self._request_id += 1
@@ -741,10 +866,14 @@ class CodexSession:
                 "params": params,
             }
         )
+        log_event(f"rpc request method={method} id={request_id}")
 
         try:
             response = response_queue.get(timeout=180)
         except queue.Empty as exc:
+            log_event(
+                f"rpc timeout method={method} id={request_id} recent_stderr={list(self._stderr_lines)[-5:]}"
+            )
             raise RuntimeError(
                 f"等待 Codex 响应 `{method}` 超时。最近日志：{list(self._stderr_lines)[-5:]}"
             ) from exc
@@ -754,8 +883,10 @@ class CodexSession:
 
         if "error" in response:
             message = response["error"].get("message", "Unknown error")
+            log_event(f"rpc error method={method} id={request_id} message={message}")
             raise CodexRpcError(message)
 
+        log_event(f"rpc success method={method} id={request_id}")
         return response["result"]
 
     def _notify(self, method: str, params: Optional[dict[str, Any]]) -> None:
@@ -785,6 +916,9 @@ class CodexSession:
 
                 process = self._process
                 if process is not None and process.poll() is not None:
+                    log_event(
+                        f"app-server exited returncode={process.returncode} recent_stderr={list(self._stderr_lines)[-10:]}"
+                    )
                     raise RuntimeError(
                         f"Codex app-server 已退出，退出码 {process.returncode}。"
                         f"最近日志：{list(self._stderr_lines)[-10:]}"
@@ -792,6 +926,7 @@ class CodexSession:
 
                 remaining = deadline - time.time()
                 if remaining <= 0:
+                    log_event(f"notification timeout recent_stderr={list(self._stderr_lines)[-10:]}")
                     raise RuntimeError(
                         f"等待 Codex 通知超时。最近日志：{list(self._stderr_lines)[-10:]}"
                     )
@@ -840,7 +975,6 @@ SESSION = CodexSession()
 STORE = ConversationStore(CONVERSATIONS_PATH)
 PROGRESS = ProgressTracker()
 TASKS = ChatTaskTracker()
-BATCH_ANALYZER = BatchCaseAnalyzer(CodexSession)
 
 
 def build_summary(conversation: dict[str, Any]) -> dict[str, Any]:
@@ -858,14 +992,26 @@ def build_summary(conversation: dict[str, Any]) -> dict[str, Any]:
 
 def run_chat_task(conversation_id: str, message: str) -> None:
     try:
+        log_event(
+            f"chat task start conversation_id={conversation_id} message_len={len(message)}"
+        )
         conversation = STORE.ensure_conversation(conversation_id)
         parsed = maybe_parse_case_export(message)
         if should_use_batch_mode(parsed, message):
-            result = BATCH_ANALYZER.analyze(
+            artifact_path = persist_batch_input(conversation["id"], message)
+            log_event(
+                f"batch input persisted conversation_id={conversation_id} path={artifact_path}"
+            )
+            TASKS.set_thinking(
                 conversation["id"],
-                message,
-                PROGRESS,
-                TASKS,
+                "已识别到超长 Case 表格，正在切换到 Codex 原生批量分析模式...",
+            )
+            result = SESSION.chat(
+                conversation["id"],
+                conversation.get("threadId"),
+                build_native_batch_prompt(message, artifact_path),
+                on_delta=lambda delta: TASKS.append(conversation["id"], delta),
+                apply_briefing=False,
             )
         else:
             result = SESSION.chat(
@@ -877,6 +1023,10 @@ def run_chat_task(conversation_id: str, message: str) -> None:
         if conversation.get("threadId") != result["threadId"]:
             STORE.set_thread_id(conversation["id"], result["threadId"])
         saved = STORE.append_exchange(conversation["id"], message, result["reply"])
+        log_event(
+            f"chat task success conversation_id={conversation_id} "
+            f"thread_id={result['threadId']} reply_len={len(result['reply'])}"
+        )
         TASKS.finish(conversation["id"], result["reply"])
         summaries = STORE.list_conversations()
         latest_summary = next(
@@ -887,6 +1037,7 @@ def run_chat_task(conversation_id: str, message: str) -> None:
             TASKS._tasks[conversation["id"]]["conversation"] = saved
             TASKS._tasks[conversation["id"]]["summary"] = latest_summary
     except Exception as exc:
+        log_event(f"chat task failure conversation_id={conversation_id} error={exc}")
         TASKS.fail(conversation_id, str(exc))
 
 
@@ -1055,7 +1206,19 @@ class OLARequestHandler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    load_local_env()
+    log_event("ola server boot")
     print(f"Using isolated CODEX_HOME at {OLA_CODEX_HOME}")
+    provider_id = active_model_provider_id()
+    env_key = active_provider_env_key()
+    if provider_id:
+        print(f"Active model provider: {provider_id}")
+        log_event(f"active model provider: {provider_id}")
+    if env_key:
+        print(f"Provider env key present: {'yes' if os.environ.get(env_key) else 'no'} ({env_key})")
+        log_event(
+            f"provider env key present: {'yes' if os.environ.get(env_key) else 'no'} ({env_key})"
+        )
     print(f"OLA demo server starting at http://{HOST}:{PORT}")
     print("首次请求时会自动拉起 codex app-server，第一次可能会稍慢。")
     httpd = ThreadingHTTPServer((HOST, PORT), OLARequestHandler)
