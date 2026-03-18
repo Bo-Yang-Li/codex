@@ -14,6 +14,7 @@ from typing import Any, Callable, Deque, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
+from batch_analysis import BatchCaseAnalyzer, maybe_parse_case_export, should_use_batch_mode
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CODEX_RS_DIR = REPO_ROOT / "codex-rs"
@@ -182,6 +183,59 @@ class ProgressTracker:
             }
             self._set_active_locked(conversation_id, "connect")
 
+    def start_batch(self, conversation_id: str, total_chunks: int, worker_count: int) -> None:
+        with self._lock:
+            self._states[conversation_id] = {
+                "visible": True,
+                "completed": False,
+                "error": None,
+                "steps": [
+                    {"key": "parse", "label": "解析并切分超长 Case", "status": "done"},
+                    {
+                        "key": "dispatch",
+                        "label": f"启动并行子 Agent（{worker_count} 个）",
+                        "status": "done",
+                    },
+                    {
+                        "key": "chunks",
+                        "label": f"并行分析分片（0/{total_chunks}）",
+                        "status": "active",
+                    },
+                    {"key": "merge", "label": "汇总所有子 Agent 结果", "status": "pending"},
+                    {"key": "done", "label": "完成", "status": "pending"},
+                ],
+            }
+
+    def update_batch_progress(
+        self,
+        conversation_id: str,
+        completed_chunks: int,
+        total_chunks: int,
+    ) -> None:
+        with self._lock:
+            state = self._states.get(conversation_id)
+            if state is None:
+                return
+            self._set_step_label_locked(
+                conversation_id,
+                "chunks",
+                f"并行分析分片（{completed_chunks}/{total_chunks}）",
+            )
+            if completed_chunks >= total_chunks:
+                self._mark_done_locked(conversation_id, "chunks")
+
+    def mark_batch_merging(self, conversation_id: str) -> None:
+        with self._lock:
+            self._mark_done_locked(conversation_id, "chunks")
+            self._set_active_locked(conversation_id, "merge")
+
+    def mark_batch_writing(self, conversation_id: str) -> None:
+        with self._lock:
+            self._mark_done_locked(conversation_id, "chunks")
+            self._mark_done_locked(conversation_id, "merge")
+            self._set_step_label_locked(conversation_id, "merge", "汇总完成，正在输出最终结论")
+            self._set_active_locked(conversation_id, "done")
+
     def mark_analyzing(self, conversation_id: str) -> None:
         with self._lock:
             self._mark_done_locked(conversation_id, "connect")
@@ -202,13 +256,15 @@ class ProgressTracker:
 
     def finish(self, conversation_id: str) -> None:
         with self._lock:
-            if conversation_id not in self._states:
+            state = self._states.get(conversation_id)
+            if state is None:
                 return
-            for key, _label in PROGRESS_STEPS[:-1]:
-                self._mark_done_locked(conversation_id, key)
+            for step in state["steps"]:
+                if step["key"] != "done":
+                    step["status"] = "done"
             self._set_active_locked(conversation_id, "done")
             self._mark_done_locked(conversation_id, "done")
-            self._states[conversation_id]["completed"] = True
+            state["completed"] = True
 
     def fail(self, conversation_id: str, message: str) -> None:
         with self._lock:
@@ -247,6 +303,15 @@ class ProgressTracker:
             if step["key"] == key:
                 step["status"] = "done"
             return
+
+    def _set_step_label_locked(self, conversation_id: str, key: str, label: str) -> None:
+        state = self._states.get(conversation_id)
+        if state is None:
+            return
+        for step in state["steps"]:
+            if step["key"] == key:
+                step["label"] = label
+                return
 
 
 class ChatTaskTracker:
@@ -352,6 +417,7 @@ class CodexSession:
         self._interaction_lock = threading.Lock()
         self._stderr_lines: Deque[str] = deque(maxlen=50)
         self._initialized = False
+
     def start(self) -> None:
         cargo = discover_cargo()
         if cargo is None:
@@ -415,7 +481,29 @@ class CodexSession:
             thread_id = self._ensure_thread(thread_id)
             PROGRESS.mark_analyzing(conversation_id)
             TASKS.set_thinking(conversation_id, "正在分析你的请求...")
+            return self.run_turn(
+                thread_id,
+                message,
+                on_delta=on_delta,
+                on_event=lambda method, params: self._handle_chat_event(
+                    conversation_id,
+                    method,
+                    params,
+                ),
+                conversation_id=conversation_id,
+            )
 
+    def run_turn(
+        self,
+        thread_id: Optional[str],
+        message: str,
+        on_delta: Optional[Callable[[str], None]] = None,
+        on_event: Optional[Callable[[str, dict[str, Any]], None]] = None,
+        conversation_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        with self._interaction_lock:
+            self.start()
+            thread_id = self._ensure_thread(thread_id)
             turn = self._rpc(
                 "turn/start",
                 {
@@ -432,7 +520,6 @@ class CodexSession:
                 },
             )
             turn_id = turn["turn"]["id"]
-
             parts: list[str] = []
             fallback_text: Optional[str] = None
 
@@ -442,36 +529,21 @@ class CodexSession:
                 method = notification.get("method")
                 params = notification.get("params") or {}
 
+                if params.get("turnId") not in {None, turn_id}:
+                    continue
+
+                if on_event is not None:
+                    on_event(method, params)
+
                 if method == "item/agentMessage/delta":
-                    if params.get("turnId") != turn_id:
-                        continue
-                    PROGRESS.mark_composing(conversation_id)
-                    TASKS.set_thinking(conversation_id, "正在整理最终回复...")
                     delta = params.get("delta", "")
                     if delta:
                         parts.append(delta)
                         if on_delta is not None:
                             on_delta(delta)
                 elif method == "item/completed":
-                    if params.get("turnId") != turn_id:
-                        continue
                     item = params.get("item") or {}
-                    item_type = item.get("type")
-                    if item_type in {
-                        "commandExecution",
-                        "fileChange",
-                        "mcpToolCall",
-                        "dynamicToolCall",
-                        "webSearch",
-                        "imageView",
-                        "imageGeneration",
-                        "collabAgentToolCall",
-                    }:
-                        PROGRESS.mark_tooling(conversation_id)
-                        TASKS.set_thinking(conversation_id, "正在调用工具和整理上下文...")
                     if item.get("type") == "agentMessage":
-                        PROGRESS.mark_composing(conversation_id)
-                        TASKS.set_thinking(conversation_id, "正在整理最终回复...")
                         fallback_text = item.get("text") or fallback_text
                 elif method == "turn/completed":
                     turn_payload = params.get("turn") or {}
@@ -480,64 +552,16 @@ class CodexSession:
                     status = turn_payload.get("status")
                     if status == "failed":
                         error = (turn_payload.get("error") or {}).get("message")
-                        PROGRESS.fail(conversation_id, error or "Codex turn failed.")
                         raise CodexRpcError(error or "Codex turn failed.")
                     if status == "interrupted":
-                        PROGRESS.fail(conversation_id, "Codex turn was interrupted.")
                         raise CodexRpcError("Codex turn was interrupted.")
-                    PROGRESS.finish(conversation_id)
                     break
                 elif method == "error":
-                    if params.get("turnId") != turn_id:
-                        continue
                     if params.get("willRetry"):
-                        TASKS.set_thinking(
-                            conversation_id,
-                            f"连接暂时中断，正在重试... {(params.get('error') or {}).get('message', '')}".strip(),
-                        )
                         continue
                     error = (params.get("error") or {}).get("message")
                     if error:
-                        PROGRESS.fail(conversation_id, error)
                         raise CodexRpcError(error)
-                elif method == "item/started":
-                    if params.get("turnId") != turn_id:
-                        continue
-                    item = params.get("item") or {}
-                    item_type = item.get("type")
-                    if item_type in {"plan", "reasoning"}:
-                        PROGRESS.mark_analyzing(conversation_id)
-                        TASKS.set_thinking(conversation_id, "正在拆解任务步骤...")
-                    elif item_type in {
-                        "commandExecution",
-                        "fileChange",
-                        "mcpToolCall",
-                        "dynamicToolCall",
-                        "webSearch",
-                        "imageView",
-                        "imageGeneration",
-                        "collabAgentToolCall",
-                    }:
-                        PROGRESS.mark_tooling(conversation_id)
-                        TASKS.set_thinking(conversation_id, "正在执行任务步骤...")
-                elif method == "item/plan/delta":
-                    if params.get("turnId") != turn_id:
-                        continue
-                    delta = params.get("delta", "")
-                    if delta:
-                        TASKS.append_thinking(conversation_id, delta)
-                elif method == "item/reasoning/textDelta":
-                    if params.get("turnId") != turn_id:
-                        continue
-                    delta = params.get("delta", "")
-                    if delta:
-                        TASKS.append_thinking(conversation_id, delta)
-                elif method == "item/reasoning/summaryTextDelta":
-                    if params.get("turnId") != turn_id:
-                        continue
-                    delta = params.get("delta", "")
-                    if delta:
-                        TASKS.append_thinking(conversation_id, delta)
 
             reply = "".join(parts).strip() or (fallback_text or "").strip()
             if not reply:
@@ -549,6 +573,85 @@ class CodexSession:
                 "turnId": turn_id,
                 "conversationId": conversation_id,
             }
+
+    def _handle_chat_event(
+        self,
+        conversation_id: str,
+        method: str,
+        params: dict[str, Any],
+    ) -> None:
+        if method == "item/agentMessage/delta":
+            PROGRESS.mark_composing(conversation_id)
+            TASKS.set_thinking(conversation_id, "正在整理最终回复...")
+            return
+
+        if method == "item/completed":
+            item = params.get("item") or {}
+            item_type = item.get("type")
+            if item_type in {
+                "commandExecution",
+                "fileChange",
+                "mcpToolCall",
+                "dynamicToolCall",
+                "webSearch",
+                "imageView",
+                "imageGeneration",
+                "collabAgentToolCall",
+            }:
+                PROGRESS.mark_tooling(conversation_id)
+                TASKS.set_thinking(conversation_id, "正在调用工具和整理上下文...")
+            if item_type == "agentMessage":
+                PROGRESS.mark_composing(conversation_id)
+                TASKS.set_thinking(conversation_id, "正在整理最终回复...")
+            return
+
+        if method == "turn/completed":
+            turn_payload = params.get("turn") or {}
+            status = turn_payload.get("status")
+            if status == "failed":
+                error = (turn_payload.get("error") or {}).get("message")
+                PROGRESS.fail(conversation_id, error or "Codex turn failed.")
+            elif status == "interrupted":
+                PROGRESS.fail(conversation_id, "Codex turn was interrupted.")
+            else:
+                PROGRESS.finish(conversation_id)
+            return
+
+        if method == "error":
+            if params.get("willRetry"):
+                TASKS.set_thinking(
+                    conversation_id,
+                    f"连接暂时中断，正在重试... {(params.get('error') or {}).get('message', '')}".strip(),
+                )
+                return
+            error = (params.get("error") or {}).get("message")
+            if error:
+                PROGRESS.fail(conversation_id, error)
+            return
+
+        if method == "item/started":
+            item_type = (params.get("item") or {}).get("type")
+            if item_type in {"plan", "reasoning"}:
+                PROGRESS.mark_analyzing(conversation_id)
+                TASKS.set_thinking(conversation_id, "正在拆解任务步骤...")
+            elif item_type in {
+                "commandExecution",
+                "fileChange",
+                "mcpToolCall",
+                "dynamicToolCall",
+                "webSearch",
+                "imageView",
+                "imageGeneration",
+                "collabAgentToolCall",
+            }:
+                PROGRESS.mark_tooling(conversation_id)
+                TASKS.set_thinking(conversation_id, "正在执行任务步骤...")
+            return
+
+        if method in {"item/plan/delta", "item/reasoning/textDelta", "item/reasoning/summaryTextDelta"}:
+            delta = params.get("delta", "")
+            if delta:
+                TASKS.append_thinking(conversation_id, delta)
 
     def _ensure_initialized(self) -> None:
         if self._initialized:
@@ -737,6 +840,7 @@ SESSION = CodexSession()
 STORE = ConversationStore(CONVERSATIONS_PATH)
 PROGRESS = ProgressTracker()
 TASKS = ChatTaskTracker()
+BATCH_ANALYZER = BatchCaseAnalyzer(CodexSession)
 
 
 def build_summary(conversation: dict[str, Any]) -> dict[str, Any]:
@@ -755,12 +859,21 @@ def build_summary(conversation: dict[str, Any]) -> dict[str, Any]:
 def run_chat_task(conversation_id: str, message: str) -> None:
     try:
         conversation = STORE.ensure_conversation(conversation_id)
-        result = SESSION.chat(
-            conversation["id"],
-            conversation.get("threadId"),
-            message,
-            on_delta=lambda delta: TASKS.append(conversation["id"], delta),
-        )
+        parsed = maybe_parse_case_export(message)
+        if should_use_batch_mode(parsed, message):
+            result = BATCH_ANALYZER.analyze(
+                conversation["id"],
+                message,
+                PROGRESS,
+                TASKS,
+            )
+        else:
+            result = SESSION.chat(
+                conversation["id"],
+                conversation.get("threadId"),
+                message,
+                on_delta=lambda delta: TASKS.append(conversation["id"], delta),
+            )
         if conversation.get("threadId") != result["threadId"]:
             STORE.set_thread_id(conversation["id"], result["threadId"])
         saved = STORE.append_exchange(conversation["id"], message, result["reply"])
