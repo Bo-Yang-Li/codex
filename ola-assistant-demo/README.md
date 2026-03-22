@@ -8,10 +8,12 @@
 
 ## 目录说明
 
-- `server.py`：中间层入口，同时负责启动 `codex app-server`
+- `server.py`：OLA HTTP 服务入口，只保留产品路由、会话存储和前端状态聚合
+- `codex_adapter.py`：薄的 Codex 适配层，当前已开始切到 Rust native bridge，后续继续向原生 `in_process/app-server-client` 对齐
 - `static/index.html`：页面结构
 - `static/styles.css`：页面样式
 - `static/app.js`：前端交互逻辑
+- `NATIVE_MIGRATION.md`：中间层瘦身与原生能力迁移清单
 
 ## 运行前确认
 
@@ -80,6 +82,12 @@ http://127.0.0.1:8765
   - 由当前这一个 Codex 线程按需直接调用原生 `spawn_agent` / `wait` / `close_agent`
   - 上下文过长时，优先依赖 Codex 原生压缩能力继续分析
   - 最终仍由主线程统一汇总成一份业务可读的中文报告
+- 当前正在推进“薄适配层”改造：
+  - OLA 前端和产品接口仍保留
+  - 但会逐步删除 Python 中间层里重复 Codex 原生语义的逻辑
+  - 第二阶段已开始引入 Rust native bridge，让 OLA 底层不再直接依赖 `codex app-server` 的 stdio 进程语义
+  - 详细路线见：
+    [`NATIVE_MIGRATION.md`](/Users/bytedance/Documents/GitHub/codex/ola-assistant-demo/NATIVE_MIGRATION.md)
 
 ## 停止服务
 

@@ -20,6 +20,7 @@ use codex_protocol::models::ContentItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::SubAgentSource;
+use futures::StreamExt;
 use http::HeaderMap;
 use http::HeaderValue;
 use http::StatusCode;
@@ -37,12 +38,21 @@ fn assert_path_ends_with(requests: &[Request], suffix: &str) {
 #[derive(Debug, Default, Clone)]
 struct RecordingState {
     stream_requests: Arc<Mutex<Vec<Request>>>,
+    execute_requests: Arc<Mutex<Vec<Request>>>,
 }
 
 impl RecordingState {
-    fn record(&self, req: Request) {
+    fn record_stream(&self, req: Request) {
         let mut guard = self
             .stream_requests
+            .lock()
+            .unwrap_or_else(|err| panic!("mutex poisoned: {err}"));
+        guard.push(req);
+    }
+
+    fn record_execute(&self, req: Request) {
+        let mut guard = self
+            .execute_requests
             .lock()
             .unwrap_or_else(|err| panic!("mutex poisoned: {err}"));
         guard.push(req);
@@ -51,6 +61,14 @@ impl RecordingState {
     fn take_stream_requests(&self) -> Vec<Request> {
         let mut guard = self
             .stream_requests
+            .lock()
+            .unwrap_or_else(|err| panic!("mutex poisoned: {err}"));
+        std::mem::take(&mut *guard)
+    }
+
+    fn take_execute_requests(&self) -> Vec<Request> {
+        let mut guard = self
+            .execute_requests
             .lock()
             .unwrap_or_else(|err| panic!("mutex poisoned: {err}"));
         std::mem::take(&mut *guard)
@@ -70,12 +88,19 @@ impl RecordingTransport {
 
 #[async_trait]
 impl HttpTransport for RecordingTransport {
-    async fn execute(&self, _req: Request) -> Result<Response, TransportError> {
-        Err(TransportError::Build("execute should not run".to_string()))
+    async fn execute(&self, req: Request) -> Result<Response, TransportError> {
+        self.state.record_execute(req);
+        Ok(Response {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Bytes::from(
+                r#"{"id":"resp-1","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}"#,
+            ),
+        })
     }
 
     async fn stream(&self, req: Request) -> Result<StreamResponse, TransportError> {
-        self.state.record(req);
+        self.state.record_stream(req);
 
         let stream = futures::stream::iter(Vec::<Result<Bytes, TransportError>>::new());
         Ok(StreamResponse {
@@ -208,6 +233,86 @@ async fn responses_client_uses_responses_path() -> Result<()> {
 
     let requests = state.take_stream_requests();
     assert_path_ends_with(&requests, "/responses");
+    Ok(())
+}
+
+#[tokio::test]
+async fn non_streaming_client_uses_execute_and_parses_output() -> Result<()> {
+    let state = RecordingState::default();
+    let transport = RecordingTransport::new(state.clone());
+    let client = ResponsesClient::new(transport, provider("openai"), NoAuth);
+
+    let request = ResponsesApiRequest {
+        model: "gpt-test".into(),
+        instructions: "Say hi".into(),
+        input: Vec::new(),
+        tools: Vec::new(),
+        tool_choice: "auto".into(),
+        parallel_tool_calls: false,
+        reasoning: None,
+        store: false,
+        stream: false,
+        include: Vec::new(),
+        service_tier: None,
+        prompt_cache_key: None,
+        text: None,
+    };
+
+    let mut stream = client
+        .stream_request(
+            request,
+            ResponsesOptions {
+                compression: Compression::None,
+                ..Default::default()
+            },
+        )
+        .await?;
+
+    let requests = state.take_execute_requests();
+    assert_path_ends_with(&requests, "/responses");
+    assert!(state.take_stream_requests().is_empty());
+
+    let first = stream
+        .next()
+        .await
+        .expect("created event present")
+        .expect("created event ok");
+    assert!(matches!(first, codex_api::ResponseEvent::Created));
+
+    let second = stream
+        .next()
+        .await
+        .expect("output item event present")
+        .expect("output item event ok");
+    assert!(matches!(
+        second,
+        codex_api::ResponseEvent::OutputItemDone(ResponseItem::Message { .. })
+    ));
+
+    let third = stream
+        .next()
+        .await
+        .expect("completed event present")
+        .expect("completed event ok");
+    match third {
+        codex_api::ResponseEvent::Completed {
+            response_id,
+            token_usage,
+        } => {
+            assert_eq!(response_id, "resp-1");
+            assert_eq!(
+                token_usage,
+                Some(codex_protocol::protocol::TokenUsage {
+                    input_tokens: 1,
+                    cached_input_tokens: 0,
+                    output_tokens: 2,
+                    reasoning_output_tokens: 0,
+                    total_tokens: 3,
+                })
+            );
+        }
+        other => panic!("expected completed event, got {other:?}"),
+    }
     Ok(())
 }
 

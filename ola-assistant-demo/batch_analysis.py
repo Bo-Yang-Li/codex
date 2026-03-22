@@ -100,9 +100,9 @@ def build_batch_decision(case_count: int, chunks: list[list[dict[str, str]]]) ->
 
 
 def build_case_payload(case: dict[str, str]) -> str:
-    content = compact_text(case.get("会话内容", ""), 900)
-    summary = compact_text(case.get("会话总结", ""), 400)
-    flow = compact_text(case.get("对话流", ""), 180)
+    content = compact_text(case.get("会话内容", ""), 500)
+    summary = compact_text(case.get("会话总结", ""), 220)
+    flow = compact_text(case.get("对话流", ""), 120)
     return "\n".join(
         [
             f"CaseID: {case.get('CaseID', '')}",
@@ -236,4 +236,8 @@ def build_native_batch_prompt(raw_message: str, artifact_path: Path) -> str:
 - 不要大段复述原始 Case 文本。
 - 直接从“总体结论”开始写，不要出现“我先……”“接着……”“结论：”之前的过程性铺垫。
 - 如果你引用抽样观察，只保留结论，不要解释你是如何抽样的。
+- 报告必须显著压缩，总长度控制在 1200 字以内，宁可更短，不要写成长文。
+- 每个一级部分最多 2 句；“典型 Case 观察”最多 3 条；“可执行优化建议”最多 5 条。
+- 不要重复输出同一标题，不要重写第二版、第三版完整报告；如果中途想修订，只允许在原结构上补 1 句，不要从头再写。
+- 优先给结论、数字和动作项，避免铺垫、解释写作过程、重复过渡句。
 """.strip()

@@ -544,7 +544,7 @@ impl ModelClientSession {
             parallel_tool_calls: prompt.parallel_tool_calls,
             reasoning,
             store: provider.is_azure_responses_endpoint(),
-            stream: true,
+            stream: self.client.state.provider.responses_streaming(),
             include,
             service_tier: match service_tier {
                 Some(ServiceTier::Fast) => Some("priority".to_string()),
